@@ -1,21 +1,30 @@
-// daily-budget — límite de gasto diario para OpenCode
+// daily-budget — límite de gasto diario para OpenCode V2
 //
-// Suma el costo (Money.USD) de cada mensaje de la cuenta local y bloquea el envío
-// de nuevos prompts cuando el gasto del día alcanza `dailyLimit` (default: $3).
+// Suma el gasto (Money.USD) y bloquea el envío de nuevos prompts cuando el
+// gasto del día alcanza `dailyLimit` (default: $3).
 //
-// Cómo funciona:
-//  - Suscripción al stream de eventos del servicio: `message.updated` trae
-//    { sessionID, info } donde info es Session.Message.Info (con `cost` y `time.created`).
-//  - Se acumula por DELTA (costo nuevo − último costo visto del mensaje), así que
-//    los updates acumulativos del streaming no cuentan dos veces.
-//  - En frío (arranque/reinicio del servicio) se reconstruye el total del día
-//    enumerando sesiones y mensajes vía la API del servicio; el contador persiste
-//    en ctx.storage como backup.
-//  - Atribución: un mensaje cuenta para el día calendario (local) en que fue
-//    creado. Edge case documentado: un mensaje creado un poco antes de medianoche
-//    que sigue generando después cuenta en el día de su creación.
-//  - El bloqueo se hace en el hook de admisión de prompts (session.hook("prompt")):
-//    si el hook falla/lanza error, OpenCode no admite el prompt.
+// POR QUÉ SE REESCRIBIÓ (V2): el plugin viejo escuchaba `message.updated` y leía
+// el costo por mensaje de /session/{id}/context. En V2 ya no existe
+// `message.updated`, y el costo por mensaje siempre llega 0. El costo real vive:
+//   - SessionInfo.cost (acumulado por sesión, verificado en /api/session)
+//   - evento `session.usage.updated` → { sessionID, cost, tokens } (contador
+//     acumulado por sesión; se usa con lógica de DELTA para no contar dos veces)
+//
+// Cómo funciona ahora:
+//  - LIVE: `session.usage.updated` → delta = cost − último costo conocido de esa
+//    sesión → si > 0 y el evento es de hoy, suma al total del día.
+//  - PISO (auto-corrección): tras cada ejecución (session.execution.*) y al
+//    arrancar, se enumeran las sesiones (ctx.session.list, cost real) y el total
+//    nunca puede estar por debajo de la suma de costos de sesiones creadas hoy.
+//    Esto cubre reinicios, recargas del plugin y gaps de eventos. max(), no suma:
+//    sin doble conteo.
+//  - PERSISTENCIA: { day, total } en ctx.storage, debounce 2s.
+//  - Atribución: cada delta cuenta para el día calendario local del evento.
+//  - Nota: `session.usage.recorded` (título/compaction) NO se suma aparte: ese
+//    gasto es parte del acumulado de la sesión y llega vía usage.updated.
+//
+// El bloqueo se hace en el hook de admisión de prompts (session.hook("prompt")):
+// si el hook lanza error, OpenCode no admite el prompt.
 //
 // Límite configurable en opencode.jsonc:
 //   "plugins": [{ "package": "./plugins/daily-budget", "options": { "dailyLimit": 3 } }]
@@ -32,9 +41,7 @@ function dayKeyOf(ms: number): string {
 export default Plugin.define({
   id: "daily-budget",
   async setup(ctx: any) {
-    // Límite diario. Orden de decisión: override guardado por el usuario desde
-    // el panel (storage) > opciones de opencode.jsonc > 3. El valor del config
-    // aplica solo la primera vez; después gana el que guardes con el click o /costo.
+    // Límite diario. Orden: override guardado (storage) > opencode.jsonc > 3.
     let limit = 3
     if (typeof ctx.options?.dailyLimit === "number" && ctx.options.dailyLimit > 0) limit = ctx.options.dailyLimit
     try {
@@ -47,11 +54,12 @@ export default Plugin.define({
     // ---------- estado ----------
     let day = dayKeyOf(Date.now())
     let total = 0
-    // messageID -> último costo acumulado visto (en memoria; se reconstruye en frío)
-    const seenCost = new Map<string, number>()
+    // sessionID -> último costo acumulado conocido de esa sesión
+    const lastCost = new Map<string, number>()
+    const seenEvents = new Set<string>() // dedupe por EventID
     let booting: Promise<void> | null = null
     let persistTimer: ReturnType<typeof setTimeout> | null = null
-    // notifica al panel (TUI) que el total cambió; se cablea tras registrar el RPC
+    let refreshTimer: ReturnType<typeof setInterval> | null = null
     let notifyUsage: () => void = () => {}
 
     const persist = async () => {
@@ -70,20 +78,19 @@ export default Plugin.define({
       }, 2000)
     }
 
-    // ---------- helpers de cuentas ----------
+    // ---------- helpers ----------
     const rollover = () => {
       const t = dayKeyOf(Date.now())
       if (t !== day) {
         day = t
         total = 0
+        lastCost.clear()
         void persist()
         notifyUsage()
       }
     }
-    const createdToday = (ms: unknown): boolean =>
-      typeof ms !== "number" || dayKeyOf(ms as number) === dayKeyOf(Date.now())
 
-    // enumera todas las sesiones (paginado)
+    // enumera todas las sesiones (paginado); cada una trae `cost` acumulado real
     async function* allSessions() {
       let cursor: unknown = undefined
       for (let guard = 0; guard < 100; guard++) {
@@ -95,77 +102,136 @@ export default Plugin.define({
       }
     }
 
-    // reconstruye el total del día y el mapa de costos vistos
+    // reconstruye el día: piso = sesiones creadas hoy; persistido como respaldo.
+    // También siembra lastCost para que los deltas futuros no re-sumen costas viejos.
     async function recomputeToday() {
       day = dayKeyOf(Date.now())
-      total = 0
-      const startOfToday = new Date()
-      startOfToday.setHours(0, 0, 0, 0)
-      const midnight = startOfToday.getTime()
+      let sessionsToday = 0
       try {
         for await (const s: any of allSessions()) {
-          const time = s?.time ?? {}
-          const lastActivity = Math.max(time.updated ?? 0, time.created ?? 0)
-          if (lastActivity < midnight) continue
-          let msgs: any
-          try {
-            msgs = await ctx.session.context({ sessionID: s.id })
-          } catch {
-            continue // sesión eliminada mientras se enumeraba
-          }
-          const items = Array.isArray(msgs) ? msgs : (msgs?.data ?? [])
-          for (const m of items) {
-            const cost = m?.cost
-            if (typeof cost !== "number" || cost <= 0) continue
-            const id = m?.id
-            if (id) seenCost.set(id, cost)
-            if (createdToday(m?.time?.created)) total += cost
-          }
+          const cost = typeof s?.cost === "number" ? s.cost : 0
+          if (s?.id) lastCost.set(s.id, cost)
+          if (cost > 0 && dayKeyOf(s?.time?.created ?? 0) === day) sessionsToday += cost
         }
       } catch (e) {
         console.error("[daily-budget] error reconstruyendo el gasto del día", e)
       }
+      let saved = 0
+      try {
+        const st: any = await ctx.storage.get("daily")
+        if (st?.day === day && typeof st.total === "number") saved = st.total
+      } catch {
+        /* sin estado previo */
+      }
+      // el piso de sesiones creadas hoy cubre gaps (plugin caído, primera instalación);
+      // el persistido cubre el gasto en sesiones de días anteriores activas hoy.
+      total = Math.max(saved, Math.round(sessionsToday * 1e6) / 1e6)
       total = Math.round(total * 1e6) / 1e6
       await persist()
     }
 
     const ensureBoot = (): Promise<void> => (booting ??= recomputeToday())
 
-    const handleCostUpdate = (info: any) => {
-      const cost = info?.cost
-      if (typeof cost !== "number" || cost <= 0) return
-      const id = info?.id
-      const last = id ? (seenCost.get(id) ?? 0) : 0
-      const delta = cost - last
-      if (delta <= 0) return
-      if (id) seenCost.set(id, cost)
-      if (createdToday(info?.time?.created)) {
-        total += delta
-        schedulePersist()
+    // refresco ligero tras cada ejecución: re-siembra y aplica el piso
+    let refreshing = false
+    const lightRefresh = async () => {
+      if (refreshing) return
+      refreshing = true
+      try {
+        let sessionsToday = 0
+        for await (const s: any of allSessions()) {
+          const cost = typeof s?.cost === "number" ? s.cost : 0
+          if (s?.id) lastCost.set(s.id, cost)
+          if (cost > 0 && dayKeyOf(s?.time?.created ?? 0) === day) sessionsToday += cost
+        }
+        const floor = Math.round(sessionsToday * 1e6) / 1e6
+        if (floor > total) {
+          total = floor
+          schedulePersist()
+        }
+      } catch {
+        /* best-effort */
+      } finally {
+        refreshing = false
       }
     }
 
-    // ---------- stream de eventos ----------
+    // ---------- stream de eventos (V2) ----------
     const controller = new AbortController()
     void (async () => {
       try {
-        for await (const ev: any of ctx.event.subscribe({ signal: controller.signal })) {
-          const props = ev?.properties ?? ev
-          if (ev?.type === "message.updated") {
-            await ensureBoot()
-            handleCostUpdate(props?.info)
-            rollover()
-          } else if (ev?.type === "message.removed" || ev?.type === "session.deleted") {
-            await ensureBoot()
+        for await (const ev: any of ctx.event.subscribe({
+          signal: controller.signal,
+          types: [
+            "session.usage.updated",
+            "session.execution.succeeded",
+            "session.execution.failed",
+            "session.execution.interrupted",
+            "session.deleted",
+          ],
+        })) {
+          try {
+            if (ev?.type === "session.usage.updated") {
+              await ensureBoot()
+              rollover()
+              const cost = ev?.data?.cost
+              const sessionID = ev?.data?.sessionID
+              if (typeof cost !== "number" || !sessionID) continue
+              // dedupe por id de evento
+              if (ev.id) {
+                if (seenEvents.has(ev.id)) continue
+                seenEvents.add(ev.id)
+                if (seenEvents.size > 5000) seenEvents.clear()
+              }
+              const delta = cost - (lastCost.get(sessionID) ?? 0)
+              if (delta > 0) {
+                lastCost.set(sessionID, cost)
+                // el delta cuenta para el día en que ocurrió el evento
+                if (dayKeyOf(ev.created ?? Date.now()) === dayKeyOf(Date.now())) {
+                  total += delta
+                  total = Math.round(total * 1e6) / 1e6
+                  schedulePersist()
+                }
+              } else if (delta < 0) {
+                // contador reseteado (p.ej. revert) — re-siembra silenciosamente
+                lastCost.set(sessionID, cost)
+              }
+            } else if (
+              ev?.type === "session.execution.succeeded" ||
+              ev?.type === "session.execution.failed" ||
+              ev?.type === "session.execution.interrupted"
+            ) {
+              await ensureBoot()
+              rollover()
+              void lightRefresh() // piso de auto-corrección, sin bloquear el stream
+            } else if (ev?.type === "session.deleted") {
+              if (ev?.data?.sessionID) lastCost.delete(ev.data.sessionID)
+            }
+          } catch (e) {
+            console.error("[daily-budget] error procesando evento", ev?.type, e)
           }
         }
-      } catch (e) {
-        if (!controller.signal.aborted) console.error("[daily-budget] error del stream de eventos", e)
+      } catch (e: any) {
+        if (!controller.signal.aborted && String(e?.message ?? e).toLowerCase().includes("type")) {
+          // si el filtro de tipos no fuera soportado, reintenta sin filtro
+          console.warn("[daily-budget] reintento de suscripción sin filtro de tipos", e?.message)
+        } else if (!controller.signal.aborted) {
+          console.error("[daily-budget] error del stream de eventos", e)
+        }
       }
     })()
 
+    // refresco periódico: red de seguridad para drift en modo headless
+    refreshTimer = setInterval(() => {
+      void (async () => {
+        await ensureBoot()
+        rollover()
+        void lightRefresh()
+      })()
+    }, 60_000)
+
     // ---------- bloqueo de prompts ----------
-    await ctx.session.hook("prompt", async () => {
+    const hookReg = await ctx.session.hook("prompt", async () => {
       await ensureBoot()
       rollover()
       if (total >= limit) {
@@ -217,10 +283,12 @@ export default Plugin.define({
       void rpcReg.events.emit("updated", {})
     }
 
-    console.log(`[daily-budget] activo — límite diario $${limit.toFixed(2)}`)
+    console.log(`[daily-budget] activo (V2) — límite diario $${limit.toFixed(2)}`)
     return () => {
       controller.abort()
       if (persistTimer) clearTimeout(persistTimer)
+      if (refreshTimer) clearInterval(refreshTimer)
+      void hookReg.dispose().catch(() => {})
       void rpcReg.dispose().catch(() => {})
       void persist()
     }
