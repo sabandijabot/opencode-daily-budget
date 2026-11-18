@@ -1,0 +1,41 @@
+{
+  "manifestVersion": 2,
+  "id": "daily-budget",
+  "name": "Daily Budget",
+  "version": "1.0.0",
+  "description": "Gasto diario de OpenCode en la barra de estado, con panel para ver hoy/mes/histórico y cambiar el tope.",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "budget",
+        "title": "Daily Budget",
+        "icon": "gauge",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "budget",
+        "text": "— / —",
+        "icon": "gauge",
+        "tone": "neutral",
+        "tooltip": "Gasto diario de OpenCode"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "notifications:show"
+    }
+  ]
+}

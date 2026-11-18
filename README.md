@@ -1,31 +1,30 @@
-﻿# opencode-daily-budget
+# daily-budget
 
-L├¡mite de gasto diario para OpenCode V2. Widget `­ƒÆ░ $X.XX / $3.00 hoy` en el
-footer; cuando el gasto del d├¡a alcanza el l├¡mite, **bloquea el env├¡o de
-prompts** hasta el reinicio de medianoche (o hasta subir el l├¡mite).
+Tope de gasto diario para **OpenCode**, con dos piezas que comparten el mismo dato:
 
-## Qu├® hace
+| Carpeta | Qué es | Dónde se ve |
+| --- | --- | --- |
+| [`plugins/opencode`](plugins/opencode) | Plugin de OpenCode V2 | Footer de la TUI, `/costo`, `/limite`, **bloqueo de prompts** |
+| [`plugins/orca`](plugins/orca) | Plugin de Orca | Barra de estado y panel lateral de Orca |
 
-- Acumula el gasto de **todas** las sesiones del d├¡a (incluye subagentes y
-  gasto auxiliar de t├¡tulo/compaction). Es contador por d├¡a, no por sesi├│n:
-  sobrevive a sesiones nuevas, cierre del TUI y reinicios del servicio.
-- Cuando `total >= dailyLimit`, el hook de admisi├│n de prompts
-  (`session.hook("prompt")`) rechaza el env├¡o ÔÇö OpenCode no lo admite.
-- Comandos: `/costo` (hoy / mes / hist├│rico) y `/limite` (cambiar l├¡mite).
-- Widget clickable para cambiar el l├¡mite al vuelo.
+El plugin de Orca **no duplica** la contabilidad: lee el RPC del plugin de OpenCode
+(`/api/rpc/daily-budget/usage`) y usa `setLimit` para cambiar el tope en caliente. Por eso el número
+que muestra es exactamente el que aplica el bloqueo.
 
-## Instalaci├│n
+## Instalar en OpenCode
 
-Copia la carpeta a tu config global de OpenCode y registra el plugin:
+Copia (o enlaza) `plugins/opencode` en tu config global:
 
-```text
-.config/opencode/plugins/daily-budget/
-Ôö£ÔöÇÔöÇ index.ts   (parte servidor: conteo + bloqueo)
-Ôö£ÔöÇÔöÇ rpc.ts     (contrato RPC)
-ÔööÔöÇÔöÇ tui.tsx    (widget + comandos)
+```
+~/.config/opencode/plugins/daily-budget/
+├── index.ts
+├── rpc.ts
+└── tui.tsx
 ```
 
-```jsonc title="~/.config/opencode/opencode.jsonc"
+Y regístralo en `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
 {
   "plugins": [
     { "package": "./plugins/daily-budget", "options": { "dailyLimit": 3 } }
@@ -33,23 +32,34 @@ Copia la carpeta a tu config global de OpenCode y registra el plugin:
 }
 ```
 
-Reinicia el TUI (o `opencode service restart`) y listo. Config recarga solo
-al editar archivos.
+Reinicia el TUI (o `opencode service restart`). Detalles en
+[`plugins/opencode/README.md`](plugins/opencode/README.md).
 
-## Nota V2 (importante)
+## Instalar en Orca
 
-En OpenCode V2 **no existe el evento `message.updated`** y los mensajes
-(`/session/{id}/context`, `/message`) llegan con `cost: 0`. El costo real vive
-en:
+Requiere Orca ≥ 1.4.248 y el plugin de OpenCode ya cargado (es su fuente de datos).
 
-- `SessionInfo.cost` ÔÇö acumulado por sesi├│n (visible en `/api/session`)
-- El evento **`session.usage.updated`** ÔåÆ `{ sessionID, cost, tokens }`
-  (contador acumulado por sesi├│n)
+```powershell
+orca plugin install <ruta-o-url-del-repo>/plugins/orca
+```
 
-Este plugin suma por delta sobre ese contador (sembrado al arranque con los
-costos reales v├¡a `ctx.session.list`) y aplica un piso de auto-correcci├│n
-(`total = max(total, suma de sesiones creadas hoy)`) tras cada
-`session.execution.*` ÔÇö as├¡ se corrige ante reinicios/recargas sin doble
-conteo.
+En desarrollo, sin publicar:
 
-Configurado y probado con OpenCode **v2.2.5**.
+```powershell
+orca plugin dev load "<ruta>\plugins\orca" --approve <fingerprint>
+orca plugin open local.daily-budget --panel budget
+```
+
+Detalles y desarrollo en [`plugins/orca/README.md`](plugins/orca/README.md).
+
+## Cómo se complementan
+
+- En el **chat de Orca**, la TUI de OpenCode no se dibuja: por eso el plugin de Orca pone el widget
+  en la barra de estado y el panel.
+- En una **terminal de OpenCode** (dentro o fuera de Orca), el plugin de OpenCode muestra su footer
+  y sus comandos.
+- El **bloqueo** siempre lo hace OpenCode; el plugin de Orca solo muestra y cambia el tope.
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).
